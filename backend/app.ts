@@ -1,10 +1,10 @@
 import express from "express";
-import { createClient } from "redis";
+import { WatchError, createClient } from "redis";
 import { json } from "body-parser";
 
 const DEFAULT_BALANCE = 100;
 
-interface ChargeResult {
+export interface ChargeResult {
     isAuthorized: boolean;
     remainingBalance: number;
     charges: number;
@@ -27,17 +27,37 @@ async function reset(account: string): Promise<void> {
     }
 }
 
-async function charge(account: string, charges: number): Promise<ChargeResult> {
+async function charge(account: string, charges: number, retries = 2): Promise<ChargeResult> {
     const client = await connect();
     try {
+        // detect the race condition (i.e. throw an exception in `client.exec()`
+        // if the balance is changed by another connection)
+        await client.watch(`${account}/balance`);
         const balance = parseInt((await client.get(`${account}/balance`)) ?? "");
-        if (balance >= charges) {
-            await client.set(`${account}/balance`, balance - charges);
-            const remainingBalance = parseInt((await client.get(`${account}/balance`)) ?? "");
-            return { isAuthorized: true, remainingBalance, charges };
-        } else {
+        // inverted the logic to improve the code readability
+        if (balance < charges) {
             return { isAuthorized: false, remainingBalance: balance, charges: 0 };
         }
+        const remainingBalance = await client
+            // enable the transaction
+            .multi()
+            // atomic decrement
+            .decrBy(`${account}/balance`, charges)
+            // execute the transaction
+            .exec()
+            // get the result of the first (and only) command and cast it to number
+            .then((response) => Number(response[0]));
+        return { isAuthorized: true, remainingBalance, charges };
+    } catch (error) {
+        // we handle only WatchError, all other errors are rethrown
+        if (!(error instanceof WatchError)) {
+            throw error;
+        }
+        if (retries == 0) {
+            throw new Error(`Too many retries while charging ${account}`);
+        }
+        console.log(`Retrying charge ${account} with ${retries} retries left`);
+        return charge(account, charges, retries - 1);
     } finally {
         await client.disconnect();
     }
